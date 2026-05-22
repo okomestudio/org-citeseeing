@@ -62,15 +62,16 @@
 (defun org-ref-vis-mode--on ()
   "Activate `org-ref-vis-mode'."
   (dolist (type org-ref-vis-types)
-    (org-link-set-parameters type
-                             :display 'org-link
-                             :activate-func
-                             (lambda (start end path _bracketp)
-                               (org-ref-vis-preview start end type path _bracketp))))
+    (org-link-set-parameters
+     type :display 'org-link
+     :activate-func
+     (lambda (start end path _bracketp)
+       (org-ref-vis-overlay--create start end type path _bracketp))))
   (add-hook 'post-command-hook #'org-ref-vis-update-cursor-state nil t))
 
 (defun org-ref-vis-mode--off ()
   "Deactivate `org-ref-vis-mode'."
+  (org-ref-vis-overlay-purge)
   (dolist (type org-ref-vis-types)
     (org-link-set-parameters type :activate-func nil)))
 
@@ -93,16 +94,20 @@ package."
 (defun org-ref-vis--citeproc-create (citekey command)
   "TBD."
   (if-let* ((bib-files (org-ref-find-bibliography)))
-      (let* ((it-getter (org-ref-vis-get-itemgetter bib-files))
-
-             (retrieved (funcall it-getter (list citekey)))
-             (item-data (cdr (assoc citekey retrieved)))
-             (lang (or (cdr (assoc "language" item-data))
-                       (cdr (assoc 'language item-data))))
-             (csl-style (and org-ref-vis-style-getter
-                             (funcall org-ref-vis-style-getter command lang)))
-             (loc-getter (org-ref-vis-csl-locale-getter)))
-        (citeproc-create csl-style it-getter loc-getter lang t))
+      (if-let* ((it-getter (org-ref-vis-get-itemgetter bib-files))
+                (retrieved (funcall it-getter (list citekey)))
+                (item-data (cdr (assoc citekey retrieved))))
+          (let ((lang (or (cdr (assoc "language" item-data))
+                          (cdr (assoc 'language item-data)))))
+            (when (null lang)
+              (message "Language not set for %s; defaults to en-US" citekey)
+              (setq lang "en-US"))
+            (if-let* ((csl-style (and org-ref-vis-style-getter
+                                      (funcall org-ref-vis-style-getter command lang))))
+                (let* ((loc-getter (org-ref-vis-csl-locale-getter)))
+                  (citeproc-create csl-style it-getter loc-getter lang t))
+              (error "No CSL style found for %s, %s" command lang)))
+        (error "No item retrieved for %s" citekey))
     (error "No bibliography files found by `org-ref-find-bibliography'")))
 
 (defun org-ref-vis-render (citekey command &optional output-fmt)
@@ -133,21 +138,21 @@ package."
 
 (defun org-ref-vis-render-author-year (citekey command &optional output-fmt)
   "TBD."
-  (let* ((output-fmt (or output-fmt 'org))
-         (proc (org-ref-vis--citeproc-create citekey command))
-         (c-author (citeproc-citation-create
-                    :cites (list (list (cons 'id citekey)))
-                    :mode 'author-only))
-         (c-year (citeproc-citation-create
-                  :cites (list (list (cons 'id citekey)))
-                  :mode 'year-only))
-         (_ (citeproc-append-citations (list c-author c-year) proc))
-         (rendered (citeproc-render-citations proc output-fmt 'no-links))
-         (s-author (nth 0 rendered))
-         (s-year (nth 1 rendered)))
-    (pcase command
-      ("textcite" (format "%s (%s)" s-author s-year))
-      (_ (format "%s %s" s-author s-year)))))
+  (if-let* ((proc (org-ref-vis--citeproc-create citekey command))
+            (c-author (citeproc-citation-create
+                       :cites (list (list (cons 'id citekey)))
+                       :mode 'author-only))
+            (c-year (citeproc-citation-create
+                     :cites (list (list (cons 'id citekey)))
+                     :mode 'year-only)))
+      (let* ((_ (citeproc-append-citations (list c-author c-year) proc))
+             (rendered (citeproc-render-citations proc (or output-fmt 'org) 'no-links))
+             (s-author (nth 0 rendered))
+             (s-year (nth 1 rendered)))
+        (pcase command
+          ("textcite" (format "%s (%s)" s-author s-year))
+          (_ (format "%s %s" s-author s-year))))
+    (format "ERROR(%s)" citekey)))
 
 (defun org-ref-vis--propertize-string (str)
   "Convert plain Org text tokens in STR into proper face properties."
@@ -175,7 +180,9 @@ package."
 (defun org-ref-vis-update-cursor-state ()
   "Update cursor state."
   (if (not org-ref-vis-mode)
-      (remove-hook 'post-command-hook #'org-ref-vis-update-cursor-state t)
+      (progn
+        (org-ref-vis-overlay-purge)
+        (remove-hook 'post-command-hook #'org-ref-vis-update-cursor-state t))
     (let ((pt (window-point)))
       (when (and org-ref-vis--active-overlay
                  (overlay-buffer org-ref-vis--active-overlay))
@@ -193,30 +200,46 @@ package."
                 (setq org-ref-vis--active-overlay ov)
                 (throw 'found t)))))))))
 
-(defun org-ref-vis-preview (start end type path _bracketp)
+(defun org-ref-vis-overlay--create (start end type path _bracketp)
   "Activation function for Org links."
   (remove-overlays start end 'category 'org-ref-vis-preview-overlay)
-
-  (let ((overlay (make-overlay start end))
-        (pt (window-point))
-        (path (substring path 1)))
-    (overlay-put overlay 'category 'org-ref-vis-preview-overlay)
-    (overlay-put overlay 'evaporate t)
-    (let* ((raw-text
-            (condition-case nil
-                (pcase type
-                  ((or "cite" "textcite")
-                   (org-ref-vis-render-author-year path type))
-                  (_ (org-ref-vis-render path type)))
-              (error (format "[Missing Key: %s]" path))))
-           (preview-text (org-ref-vis--propertize-string raw-text)))
-      (overlay-put overlay 'my-preview-string preview-text)
-
+  (when-let*
+      ((pt (window-point))
+       (citekey (when (string-match "\\`&\\(.*\\)" path)
+                  (match-string 1 path)))
+       (raw-text (pcase type
+                   ((or "cite" "textcite")
+                    (org-ref-vis-render-author-year citekey type))
+                   (_ (org-ref-vis-render citekey type)))
+                 ;; (condition-case err
+                 ;;     (pcase type
+                 ;;       ((or "cite" "textcite")
+                 ;;        (org-ref-vis-render-author-year path type))
+                 ;;       (_ (org-ref-vis-render path type)))
+                 ;;   (error
+                 ;;    (format "[Error: %s (%S)]" path err)
+                 ;;    (signal (car err) (cdr err))))
+                 )
+       (display-text (org-ref-vis--propertize-string raw-text)))
+    (let* ((ov (make-overlay start end)))
+      (overlay-put ov 'category 'org-ref-vis-preview-overlay)
+      (overlay-put ov 'evaporate t)
+      (overlay-put ov 'my-preview-string display-text)
       (if (and (<= start pt) (<= pt end))
           (progn
-            (overlay-put overlay 'display nil)
-            (setq org-ref-vis--active-overlay overlay))
-        (overlay-put overlay 'display preview-text)))))
+            (overlay-put ov 'display nil)
+            (setq org-ref-vis--active-overlay ov))
+        (overlay-put ov 'display display-text)))))
+
+(defun org-ref-vis-overlay-purge ()
+  (interactive)
+  (save-restriction
+    (widen)
+    (let ((ovs (overlays-in (point-min) (point-max))))
+      (dolist (ov ovs)
+        (when (eq (overlay-get ov 'category) 'org-ref-vis-preview-overlay)
+          (delete-overlay ov)))))
+  (setq org-ref-vis--active-overlay nil))
 
 (provide 'org-ref-vis)
 ;;; org-ref-vis.el ends here
