@@ -61,7 +61,9 @@
     "textcite")
   "Org link types for which overlays are created.")
 
-(defvar-local org-ref-vis--active-overlay nil)
+(defvar org-ref-vis-links-generator #'org-dynamic-links-default-generator)
+
+;; (defvar-local org-ref-vis--active-overlay nil)
 
 ;;;###autoload
 (define-minor-mode org-ref-vis-mode
@@ -74,19 +76,29 @@
 
 (defun org-ref-vis-mode--on ()
   "Activate `org-ref-vis-mode'."
-  (dolist (type org-ref-vis-types)
-    (org-link-set-parameters
-     type :display 'org-link
-     :activate-func
-     (lambda (start end path _bracketp)
-       (org-ref-vis-overlay--create start end type path _bracketp))))
-  (add-hook 'post-command-hook #'org-ref-vis-update-cursor-state nil t))
+  (advice-add #'bibtex-completion-clear-cache :after
+              #'org-ref-vis--cache-clear)
+  (advice-add #'org-activate-links :around
+              #'org-ref-vis--activate-links-ad)
+  ;; Ensure font-lock natively tracks and cleans up the 'display property when redrawing
+  (make-local-variable 'font-lock-extra-managed-props)
+  (add-to-list 'font-lock-extra-managed-props 'display)
+  (when (derived-mode-p 'org-mode)
+    (org-restart-font-lock)))
 
 (defun org-ref-vis-mode--off ()
   "Deactivate `org-ref-vis-mode'."
-  (org-ref-vis-overlay-purge)
-  (dolist (type org-ref-vis-types)
-    (org-link-set-parameters type :activate-func nil)))
+  (advice-remove #'org-activate-links
+                 #'org-ref-vis--activate-links-ad)
+  (setq font-lock-extra-managed-props
+        (remove 'display font-lock-extra-managed-props))
+  (when (derived-mode-p 'org-mode)
+    (org-restart-font-lock))
+  (advice-remove #'bibtex-completion-clear-cache #'org-ref-vis--cache-clear))
+
+(defun org-ref-vis--cache-clear (&rest _args)
+  "Reset item getter."
+  (setq org-ref-vis-itemgetter nil))
 
 (defun org-ref-vis-csl-locale-getter ()
   "Return CSL locale getter function.
@@ -141,7 +153,8 @@ Returns a list containing (MODES FORMAT-STRING). Defaults to ((nil) \"%s\")."
               (citations (mapcar (lambda (mode)
                                    (citeproc-citation-create
                                     :cites (list (list (cons 'id citekey)))
-                                    :mode mode))
+                                    :mode mode
+                                    :suppress-affixes t))
                                  modes)))
         (progn
           ;; Append and render all generated citations at once
@@ -151,81 +164,59 @@ Returns a list containing (MODES FORMAT-STRING). Defaults to ((nil) \"%s\")."
             (apply #'format fmt rendered)))
       (error "Item cannot be rendered (%s)" citekey))))
 
-(defun org-ref-vis-update-cursor-state ()
-  "Update cursor state."
-  (if (not org-ref-vis-mode)
-      (progn
-        (org-ref-vis-overlay-purge)
-        (remove-hook 'post-command-hook #'org-ref-vis-update-cursor-state t))
-    (let ((pt (window-point)))
-      (when (and org-ref-vis--active-overlay
-                 (overlay-buffer org-ref-vis--active-overlay))
-        (unless (and (<= (overlay-start org-ref-vis--active-overlay) pt)
-                     (<= pt (overlay-end org-ref-vis--active-overlay)))
-          (overlay-put org-ref-vis--active-overlay 'display
-                       (overlay-get org-ref-vis--active-overlay 'my-preview-string))
-          (setq org-ref-vis--active-overlay nil)))
-      (unless org-ref-vis--active-overlay
-        (let ((ovs (overlays-at pt)))
-          (catch 'found
-            (dolist (ov ovs)
-              (when (eq (overlay-get ov 'category) 'org-ref-vis-preview-overlay)
-                (overlay-put ov 'display nil)
-                (setq org-ref-vis--active-overlay ov)
-                (throw 'found t)))))))))
-
-(defun org-ref-vis--propertize (str)
+(defun org-ref-vis--propertize (str &optional face)
   "Convert plain Org text tokens in STR into proper face properties."
-  (with-temp-buffer
-    (insert str)
-    (org-mode)
-    (font-lock-ensure)
-    (buffer-string)))
+  (let ((s (with-temp-buffer
+             (insert str)
+             (org-mode)
+             (font-lock-ensure)
+             (buffer-string))))
+    (when face
+      (add-face-text-property 0 (length s) face t s))
+    s))
 
-(defun org-ref-vis-overlay--create (start end type path _bracketp)
-  "Create overlays for Org link TYPE for PATH.
-Org links are scanned in region from START to END. Use this as an activation
-function for Org links."
-  (remove-overlays start end 'category 'org-ref-vis-preview-overlay)
-  (when-let*
-      ((pt (window-point))
-       (citekey (when (string-match "\\`&\\(.*\\)" path)
-                  (match-string 1 path)))
-       (display-text
-        (condition-case err
-            (org-ref-vis--propertize (org-ref-vis-render citekey type))
-          (error
-           (let ((s (format "[%s:%s (%s)]"
-                            type citekey (error-message-string err))))
-             (put-text-property 0 (length s)
-                                'face 'org-ref-bad-cite-key-face
-                                s)
-             s)))))
-    (let* ((ov (make-overlay start end)))
-      (overlay-put ov 'category 'org-ref-vis-preview-overlay)
-      (overlay-put ov 'evaporate t)
-      (overlay-put ov 'my-preview-string display-text)
-      (if (and (<= start pt) (<= pt end))
-          (progn
-            (overlay-put ov 'display nil)
-            (setq org-ref-vis--active-overlay ov))
-        (overlay-put ov 'display display-text)))))
+(defun org-dynamic-links-default-generator (lnk)
+  "A default fallback generator that prepends a helper icon to the PATH."
+  (let ((re (regexp-opt (org-link-types) t)))
+    (if (string-match (format "^%s:\\(.*\\)$" re) lnk)
+        (let ((type (match-string 1 lnk))
+              (path (match-string 2 lnk)))
+          (cond
+           ((member type org-ref-vis-types)
+            (let* ((citekey (when (string-match "\\`&\\(.*\\)" path)
+                              (match-string 1 path)))
+                   (args
+                    (condition-case err
+                        (list (org-ref-vis-render citekey type)
+                              'org-ref-cite-face)
+                      (error
+                       (list (format "%s:%s"
+                                     type citekey
+                                     ;; (error-message-string err)
+                                     )
+                             'org-ref-bad-cite-key-face)))))
+              (apply #'org-ref-vis--propertize args)))
+           (t nil)))
+      nil)))
 
-(defun org-ref-vis-overlay-purge ()
-  (interactive)
-  (save-restriction
-    (widen)
-    (let ((ovs (overlays-in (point-min) (point-max))))
-      (dolist (ov ovs)
-        (when (eq (overlay-get ov 'category) 'org-ref-vis-preview-overlay)
-          (delete-overlay ov)))))
-  (setq org-ref-vis--active-overlay nil))
-
-(defun org-ref-vis--cache-clear (&rest _args)
-  (setq org-ref-vis-itemgetter nil))
-
-(advice-add 'bibtex-completion-clear-cache :after
-            #'org-ref-vis--cache-clear)
+(defun org-ref-vis--activate-links-ad (fun _limit)
+  "Around-advice wrapper for FUN (`org-activate-links').
+Intercepts font-lock execution to inject dynamic display strings."
+  (if-let* ((start-pos (point))
+            (ret (funcall fun _limit)))
+      (if org-link-descriptive
+          (catch :exit
+            (save-excursion
+              (goto-char start-pos)
+              (while (re-search-forward "\\[\\[\\([^]]+\\)\\]\\]" _limit t)
+                (when-let* ((beg (match-beginning 0))
+                            (end (match-end 0))
+                            (lnk (match-string 1))
+                            (text (funcall org-ref-vis-links-generator lnk)))
+                  (put-text-property beg end 'display text)
+                  (throw :exit t))))
+            ret)
+        ret)))
 
 (provide 'org-ref-vis)
 ;;; org-ref-vis.el ends here
