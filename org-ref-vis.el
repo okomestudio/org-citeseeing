@@ -31,39 +31,54 @@
 
 (require 'org-ref)
 (require 'citeproc)
+(require 's)
 (require 'seq)
 
-(defcustom org-ref-vis-style-getter nil
-  "A function that takes COMMAND LANG.")
+(defcustom org-ref-vis-csl-dir
+  "/usr/share/citation-style-language"
+  "The CSL directory path."
+  :type 'directory
+  :group 'org-ref)
 
-(defvar org-ref-vis-csl-locales-dir "/usr/share/citation-style-language/locales/")
+(defcustom org-ref-vis-style-getter
+  "chicago-note-bibliography.csl"
+  "A function that takes COMMAND LANG."
+  :type '(choice (function :tag "Function")
+                 (file :tag "Path to CSL style file"))
+  :group 'org-ref)
+
 (defvar org-ref-vis-bib-files nil)
 (defvar org-ref-vis-itemgetter nil)
+(defvar org-ref-vis-types nil)
+(defvar org-ref-vis-citeproc-modes
+  '(author-only
+    bib-entry
+    locator-only
+    nil
+    suppress-author
+    textual
+    title-only
+    year-only))
 
-(defvar org-ref-vis-command-alist
-  '((("cite" "Cite" "parencite" "Parencite" "fullcite") . ((bib-entry) "%s"))
-    (("citeauthor" "citeauthor*") . ((author-only) "%s"))
-    (("citetitle" "citetitle*" "citeurl") . ((title-only) "%s"))
-    (("citeyear" "citeyear*") . ((year-only) "%s"))
-    (("footfullcite") . ((nil) "%s"))
-    (("textcite") . ((author-only year-only) "%s (%s)"))
-    (("textcite-bare") . ((author-only year-only) "%s %s")))
-  "Mapping of citation commands to a list of (MODES FORMAT-STRING).")
-
-(defvar org-ref-vis-types
-  '("cite"
-    "citeauthor"
-    "citetitle"
-    "citeyear"
-    "footfullcite"
-    "fullcite"
-    "parencite"
-    "textcite")
-  "Org link types for which overlays are created.")
+(defcustom org-ref-vis-command-alist
+  '((("cite" "Cite" "parencite" "Parencite") . ((nil) "${nil}"))
+    (("citeauthor" "citeauthor*") . ((author-only) "${author-only}"))
+    (("citetitle" "citetitle*" "citeurl") . ((title-only) "${title-only}"))
+    (("citeyear" "citeyear*") . ((year-only) "${year-only}"))
+    ;; (("footfullcite") . ((nil) "${nil}"))
+    (("fullcite") . ((bib-entry) "${bib-entry}"))
+    ;; (("textcite") . ((author-only year-only) "${author-only} (${year-only})"))
+    ;; (("textcite-bare") . ((author-only year-only) "${author-only} ${year-only}"))
+    )
+  "Mapping of citation commands to a list of (MODES FORMAT-STRING)."
+  :type 'alist
+  :set (lambda (sym val)
+         (set-default sym val)
+         (setq org-ref-vis-types
+               (seq-mapcat #'car org-ref-vis-command-alist)))
+  :group 'org-ref)
 
 (defvar org-ref-vis-links-generator #'org-dynamic-links-default-generator)
-
-;; (defvar-local org-ref-vis--active-overlay nil)
 
 ;;;###autoload
 (define-minor-mode org-ref-vis-mode
@@ -104,37 +119,44 @@
   "Return CSL locale getter function.
 In Debian, the directory is installed with the citation-style-language-locales
 package."
-  (if (file-directory-p org-ref-vis-csl-locales-dir)
-      (citeproc-locale-getter-from-dir org-ref-vis-csl-locales-dir)
-    (error "CSL locales directory not found: %s" org-ref-vis-csl-locales-dir)))
+  (let ((dir (file-name-concat org-ref-vis-csl-dir "locales")))
+    (if (file-directory-p dir)
+        (citeproc-locale-getter-from-dir dir)
+      (error "CSL locales directory not found: %s" dir))))
 
 (defun org-ref-vis-get-itemgetter (bib-files)
-  "Return itemgetter function for BIB-FILES."
+  "Return itemgetter function for BIB-FILES.
+If the item getter function exists for BIB-FILES, it will be reused. If not, the
+function will be created and cached to `org-ref-vis-itemgetter'."
   (if (and org-ref-vis-itemgetter
            (equal bib-files org-ref-vis-bib-files))
       org-ref-vis-itemgetter
     (setq org-ref-vis-bib-files bib-files
           org-ref-vis-itemgetter (citeproc-hash-itemgetter-from-any bib-files))))
 
-(defun org-ref-vis--citeproc-create (citekey command)
-  "Create CSL processor for CITEKEY and COMMAND."
-  (if-let* ((bib-files (org-ref-find-bibliography)))
-      (if-let* ((it-getter (org-ref-vis-get-itemgetter bib-files))
-                (retrieved (funcall it-getter (list citekey)))
-                (item-data (cdr (assoc citekey retrieved))))
-          (let ((lang (or (cdr (assoc "language" item-data))
-                          (cdr (assoc 'language item-data)))))
-            (when (null lang)
-              (message "Language not set for %s; defaults to en-US" citekey)
-              (setq lang "en-US"))
-            (if-let* ((csl-style
-                       (and org-ref-vis-style-getter
-                            (funcall org-ref-vis-style-getter command lang))))
-                (let* ((loc-getter (org-ref-vis-csl-locale-getter)))
-                  (citeproc-create csl-style it-getter loc-getter lang t))
-              (error "No CSL style found for %s, %s" command lang)))
-        (error "No item for key %s" citekey))
-    (error "No bibliography files found by `org-ref-find-bibliography'")))
+(defun org-ref-vis-item-lang (item)
+  "TBD."
+  (or (cdr (assoc "language" item))
+      (cdr (assoc 'language item))
+      "en-US"))
+
+(defun org-ref-vis-csl-file (command lang)
+  "TBD."
+  (cond ((functionp org-ref-vis-style-getter)
+         (funcall org-ref-vis-style-getter command lang))
+        ((stringp org-ref-vis-style-getter)
+         (if (file-name-absolute-p org-ref-vis-style-getter)
+             org-ref-vis-style-getter
+           (file-name-concat org-ref-vis-csl-dir
+                             "styles"
+                             org-ref-vis-style-getter)))))
+
+(defun org-ref-vis--citeproc-create (it-getter lang command)
+  "Create CSL processor for LANG and COMMAND."
+  (if-let* ((csl-style (org-ref-vis-csl-file command lang)))
+      (let* ((loc-getter (org-ref-vis-csl-locale-getter)))
+        (citeproc-create csl-style it-getter loc-getter lang t))
+    (error "No CSL style found for %s, %s" command lang)))
 
 (defun org-ref-vis--get-command-spec (command)
   "Look up COMMAND in `org-ref-vis-command-alist'.
@@ -145,32 +167,62 @@ Returns a list containing (MODES FORMAT-STRING). Defaults to ((nil) \"%s\")."
         (cdr entry)
       '((nil) "%s"))))
 
-(defun org-ref-vis-render (citekey command &optional output-fmt)
+(defun org-ref-vis-render (citekey command &optional _output-fmt)
   "Render CITEKEY according to COMMAND format."
   (pcase-let ((`(,modes ,fmt) (org-ref-vis--get-command-spec command)))
-    (if-let* ((proc (org-ref-vis--citeproc-create citekey command))
-              ;; Generate a list of citation objects based on the requested modes
-              (citations (mapcar (lambda (mode)
-                                   (citeproc-citation-create
-                                    :cites (list (list (cons 'id citekey)))
-                                    :mode mode
-                                    :suppress-affixes t))
-                                 modes)))
+    (if-let* ((ig (org-ref-vis-get-itemgetter (org-ref-find-bibliography)))
+              (item (cdr (assoc citekey (funcall ig (list citekey)))))
+              (lang (org-ref-vis-item-lang item))
+              (proc (org-ref-vis--citeproc-create ig lang command))
+              (citations (mapcar
+                          (lambda (mode)
+                            (when (member mode org-ref-vis-citeproc-modes)
+                              (citeproc-citation-create
+                               :cites (list (list (cons 'id citekey)))
+                               :mode mode
+                               :suppress-affixes t)))
+                          modes)))
         (progn
-          ;; Append and render all generated citations at once
           (citeproc-append-citations citations proc)
-          (let ((rendered (citeproc-render-citations proc (or output-fmt 'org) 'no-links)))
-            ;; Inject the rendered string(s) into the format string
-            (apply #'format fmt rendered)))
+          (let* ((rendered (citeproc-render-citations
+                            proc (or _output-fmt 'org) 'no-links))
+                 (al (cl-pairlis modes rendered)))
+            (s-format fmt
+                      (lambda (key)
+                        (setq key (intern key))
+                        (if (member key org-ref-vis-citeproc-modes)
+                            (alist-get key al)
+                          (alist-get key item))))))
       (error "Item cannot be rendered (%s)" citekey))))
 
+(defun org-ref-vis-render-isolated (citekey command &optional _output-fmt)
+  "Render CITEKEY according to COMMAND format.
+This version renders isolated references using `citeproc-create-style' and
+`citeproc-render-item'."
+  (if-let* ((ig (org-ref-vis-get-itemgetter (org-ref-find-bibliography)))
+            (item (cdr (assoc citekey (funcall ig (list citekey)))))
+            (lang (org-ref-vis-item-lang item))
+            (lg (org-ref-vis-csl-locale-getter))
+            (style (citeproc-create-style (org-ref-vis-csl-file command lang) lg)))
+      (citeproc-render-item item style 'bib (or _output-fmt 'org))
+    (error "Item cannot be rendered (%s)" citekey)))
+
 (defun org-ref-vis--propertize (str &optional face)
-  "Convert plain Org text tokens in STR into proper face properties."
-  (let ((s (with-temp-buffer
-             (insert str)
-             (org-mode)
-             (font-lock-ensure)
-             (buffer-string))))
+  "Convert plain Org text tokens in STR into proper face properties.
+When given, FACE is applied additionally."
+  (let* ((s str)
+
+         ;; BUG(2026-06-05): Somehow, `citeproc-render-item' can produce
+         ;; Org-rendered string including these HTML tags. Strip them here.
+         (case-fold-search t)
+         (s (replace-regexp-in-string
+             "<Span Class=\"Nocase\">\\|</Span>" "" s))
+
+         (s (with-temp-buffer
+              (insert s)
+              (org-mode)
+              (font-lock-ensure)
+              (buffer-string))))
     (when face
       (add-face-text-property 0 (length s) face t s))
     s))
@@ -185,16 +237,19 @@ Returns a list containing (MODES FORMAT-STRING). Defaults to ((nil) \"%s\")."
            ((member type org-ref-vis-types)
             (let* ((citekey (when (string-match "\\`&\\(.*\\)" path)
                               (match-string 1 path)))
+                   ;; (args (list (org-ref-vis-render citekey type)
+                   ;;             'org-ref-cite-face))
                    (args
                     (condition-case err
                         (list (org-ref-vis-render citekey type)
                               'org-ref-cite-face)
                       (error
-                       (list (format "%s:%s"
+                       (list (format "err:%s:%s"
                                      type citekey
                                      ;; (error-message-string err)
                                      )
-                             'org-ref-bad-cite-key-face)))))
+                             'org-ref-bad-cite-key-face))))
+                   )
               (apply #'org-ref-vis--propertize args)))
            (t nil)))
       nil)))
