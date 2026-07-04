@@ -167,10 +167,14 @@ Returns a list containing (MODES FORMAT-STRING). Defaults to ((nil) \"%s\")."
         (cdr entry)
       '((nil) "%s"))))
 
+(defun org-ref-vis-find-bibliography ()
+  (or (org-ref-find-bibliography)
+      citar-bibliography))
+
 (defun org-ref-vis-render (citekey command &optional _output-fmt)
   "Render CITEKEY according to COMMAND format."
   (pcase-let ((`(,modes ,fmt) (org-ref-vis--get-command-spec command)))
-    (if-let* ((ig (org-ref-vis-get-itemgetter (org-ref-find-bibliography)))
+    (if-let* ((ig (org-ref-vis-get-itemgetter (org-ref-vis-find-bibliography)))
               (item (cdr (assoc citekey (funcall ig (list citekey)))))
               (lang (org-ref-vis-item-lang item))
               (proc (org-ref-vis--citeproc-create ig lang command))
@@ -199,7 +203,7 @@ Returns a list containing (MODES FORMAT-STRING). Defaults to ((nil) \"%s\")."
   "Render CITEKEY according to COMMAND format.
 This version renders isolated references using `citeproc-create-style' and
 `citeproc-render-item'."
-  (if-let* ((ig (org-ref-vis-get-itemgetter (org-ref-find-bibliography)))
+  (if-let* ((ig (org-ref-vis-get-itemgetter (org-ref-vis-find-bibliography)))
             (item (cdr (assoc citekey (funcall ig (list citekey)))))
             (lang (org-ref-vis-item-lang item))
             (lg (org-ref-vis-csl-locale-getter))
@@ -244,10 +248,9 @@ When given, FACE is applied additionally."
                         (list (org-ref-vis-render citekey type)
                               'org-ref-cite-face)
                       (error
-                       (list (format "err:%s:%s"
+                       (list (format "err:%s:%s:%s"
                                      type citekey
-                                     ;; (error-message-string err)
-                                     )
+                                     (error-message-string err))
                              'org-ref-bad-cite-key-face))))
                    )
               (apply #'org-ref-vis--propertize args)))
