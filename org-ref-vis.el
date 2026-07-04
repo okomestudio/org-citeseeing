@@ -36,7 +36,13 @@
 
 (defcustom org-ref-vis-csl-dir
   "/usr/share/citation-style-language"
-  "The CSL directory path."
+  "The CSL directory path.
+On Debian, you need the following packages:
+
+  - citation-style-language-locales
+  - citation-style-language-styles
+
+to fill the necessary files under this directory tree."
   :type 'directory
   :group 'org-ref)
 
