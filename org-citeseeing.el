@@ -1,9 +1,9 @@
-;;; org-ref-vis.el --- org-ref-vis.el  -*- lexical-binding: t -*-
+;;; org-citeseeing.el --- Render Org Citation  -*- lexical-binding: t -*-
 ;;
 ;; Copyright (C) 2026 Taro Sato
 ;;
 ;; Author: Taro Sato <okomestudio@gmail.com>
-;; URL: https://github.com/okomestudio/org-ref-ok/org-ref-vis.el
+;; URL: https://github.com/okomestudio/org-citeseeing/org-citeseeing.el
 ;; Version: 0.1.1
 ;; Keywords: convenience
 ;; Package-Requires: ((emacs "30.1"))
@@ -284,5 +284,5 @@ Intercepts font-lock execution to inject dynamic display strings."
             ret)
         ret)))
 
-(provide 'org-ref-vis)
-;;; org-ref-vis.el ends here
+(provide 'org-citeseeing)
+;;; org-citeseeing.el ends here
