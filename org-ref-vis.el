@@ -99,6 +99,8 @@ to fill the necessary files under this directory tree."
   "Activate `org-ref-vis-mode'."
   (advice-add #'bibtex-completion-clear-cache :after
               #'org-ref-vis--cache-clear)
+  (advice-add #'citar-cache--update-bibliography :after
+              #'org-ref-vis--cache-clear)
   (advice-add #'org-activate-links :around
               #'org-ref-vis--activate-links-ad)
   ;; Ensure font-lock natively tracks and cleans up the 'display property when redrawing
