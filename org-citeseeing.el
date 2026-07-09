@@ -36,22 +36,23 @@
 (require 's)
 (require 'seq)
 
-(defvar org-citeseeing-csl--styles-dir nil)
-(defvar org-citeseeing-csl--locales-dir nil)
-(defvar org-citeseeing--cite-commands nil)
-(defvar org-citeseeing--citeproc-modes
-  '( author-only bib-entry locator-only nil suppress-author
-     textual title-only year-only ))
-
 (defgroup org-citeseeing nil
   "Customization group for `org-citeseeing'."
   :group 'faces
   :prefix "org-citeseeing-")
 
-(defcustom org-citeseeing-debug nil
+;;; Custom Variables
+
+;; Forward Declarations (to avoid errors within defcustoms)
+(defvar org-citeseeing--cite-commands)
+
+(defcustom org-citeseeing-debug t
   "Set non-nil for verbose debug messages."
   :type 'boolean
-  :group 'org-citeseeing)
+  :group 'org-citeseeing
+  :set (lambda (sym val)
+         (set-default sym val)
+         (require 'backtrace)))
 
 (defcustom org-citeseeing-bibliography nil
   "Bibliography files to watch."
@@ -102,11 +103,13 @@ Unless the file path is absolute, it will be sought in `org-citeseeing-csl--styl
   :group 'org-citeseeing)
 
 (defcustom org-citeseeing-command-alist
-  '((("cite" "Cite" "parencite" "Parencite") . "${cp:nil}")
-    (("citeauthor" "citeauthor*") . "${cp:author-only}")
-    (("citetitle" "citetitle*" "citeurl") . "${cp:title-only}")
-    (("citeyear" "citeyear*") . "${cp:year-only}")
-    ("fullcite" . "${cp:bib-entry}"))
+  '((("cite" "Cite" "parencite" "Parencite") . ("" "${cp:nil}" ""))
+    (("citep" "citep*") . ("(" "${cp:nil}" ")"))
+    (("citet" "citet*") . ("" "${cp:author-only} (${cp:year-only})" ""))
+    (("citeauthor" "citeauthor*") . ("" "${cp:author-only}" ""))
+    (("citetitle" "citetitle*" "citeurl") . ("" "${cp:title-only}" ""))
+    (("citeyear" "citeyear*") . ("" "${cp:year-only}" ""))
+    ("fullcite" . ("" "${cp:bib-entry}" "")))
   "Alist mapping of cite command(s) to string format template.
 See `org-citeseeing--format' for detail on string format template.
 
@@ -115,19 +118,20 @@ The field name starting with 'cp:' refers to a `citeproc' mode (see
 current bibliography item, its value obtained via `org-citeseeing-bib-item-value-getter'."
   :type '(alist :key-type (choice (string :tag "Single command")
                                   (repeat :tag "List of commands" string))
-                :value-type (string :tag "Format template"))
+                :value-type (repeat :tag "List of prefix format suffix" string))
   :set
   (lambda (sym val)
     (set-default sym val)
 
     ;; Ensure `org-citeseeing--cite-commands' is an empty hash table:
-    (if (and org-citeseeing--cite-commands
+    (if (and (boundp 'org-citeseeing--cite-commands)
+             org-citeseeing--cite-commands
              (hash-table-p org-citeseeing--cite-commands))
         (clrhash org-citeseeing--cite-commands)
       (setq-default org-citeseeing--cite-commands
                     (make-hash-table :test #'equal)))
 
-    (pcase-dolist (`(,commands . ,fmt) val)
+    (pcase-dolist (`(,commands . (,prefix ,fmt ,suffix)) val)
       (dolist (command (or (and (stringp commands) (list commands))
                            commands))
         (let ((modes
@@ -138,7 +142,9 @@ current bibliography item, its value obtained via `org-citeseeing-bib-item-value
                             (and (string-prefix-p "cp:" field)
                                  (substring field 3))))
                         (s-match-strings-all "\\${\\([^}]+\\)}" fmt)))))
-          (puthash command (list modes fmt) org-citeseeing--cite-commands)))))
+          (puthash command
+                   (list modes (list prefix fmt suffix))
+                   org-citeseeing--cite-commands)))))
   :group 'org-citeseeing)
 
 (defcustom org-citeseeing-cache-eviction-registry
@@ -154,6 +160,13 @@ bibliography manager you are using (e.g., `bibtex-completion' or `citar'."
 
 (defface org-citeseeing-cite-error-face '((t :inherit org-warning))
   "Face used for citation when error occurs while rendering.")
+
+(defvar org-citeseeing-csl--styles-dir nil)
+(defvar org-citeseeing-csl--locales-dir nil)
+(defvar org-citeseeing--cite-commands nil)
+(defvar org-citeseeing--citeproc-modes
+  '( author-only bib-entry locator-only nil suppress-author
+     textual title-only year-only ))
 
 ;;;###autoload
 (define-minor-mode org-citeseeing-mode
@@ -208,7 +221,9 @@ Intercepts font-lock execution to inject dynamic display strings."
                         (end (match-end 0))
                         (type (match-string 1))
                         (path (match-string 2))
-                        (txt (org-citeseeing-links-generator type path)))
+                        (txt (org-citeseeing--render-citation-link
+                              (substring-no-properties type)
+                              (substring-no-properties path))))
               (put-text-property beg end 'display txt)
               (throw :exit t))))))
     retval))
@@ -228,7 +243,7 @@ Intercepts font-lock execution to inject dynamic display strings."
                  (end (cdr bounds)))
             (with-silent-modifications
               (put-text-property beg end 'display
-                                 (format "R:%s" ))))))
+                                 (format "R:%s" citation))))))
 
       (setq-local org-cite-activate-processor 'org-citeseeing-oc-processor))))
 
@@ -324,10 +339,27 @@ The itemgetter function gets cached for BIB-FILES and will be reused."
                               :capitalize-first nil
                               :ignore-et-al nil)))
 
+(defvar org-citeseeing--citeproc-citation-render-errfun
+  (lambda (str)
+    (cond
+     ((string-prefix-p "NO_ITEM_DATA:" str)
+      (error "NO_ITEM_DATA"))
+     (t str))))
+
 (defun org-citeseeing--citeproc-citation-render (proc citations)
   "Render CITATIONS using citeproc PROC."
   (citeproc-append-citations citations proc)
-  (citeproc-render-citations proc 'org 'no-links))
+  (mapcar (lambda (str)
+            (let ((case-fold-search t)
+                  ;; BUG(2026-06-05): Somehow, `citeproc-render-item' can
+                  ;; produce Org-rendered string including these HTML tags.
+                  ;; Strip them here.
+                  (str (replace-regexp-in-string
+                        "<Span Class=\"Nocase\">\\|</Span>" "" str)))
+              (if (functionp org-citeseeing--citeproc-citation-render-errfun)
+                  (funcall org-citeseeing--citeproc-citation-render-errfun str)
+                str)))
+          (citeproc-render-citations proc 'org 'no-links)))
 
 (defun org-citeseeing--format (template fallback)
   "Extended version of `s-format' for `citeproc'."
@@ -342,26 +374,56 @@ The itemgetter function gets cached for BIB-FILES and will be reused."
                                   field citekey))
                     (format "?%s?" field))))))
 
+(defun org-citeseeing--propertize (str &optional face)
+  "Convert plain Org text tokens in STR into proper face properties.
+When given, FACE is applied additionally."
+  (let ((str (with-temp-buffer
+               (insert str)
+               (org-mode)
+               (font-lock-ensure)
+               (buffer-string))))
+    (when face
+      (add-face-text-property 0 (length str) face t str))
+    str))
+
 (defun org-citeseeing-render (citekey command)
   "Render CITEKEY according to COMMAND."
-  (if-let* ((spec (gethash command org-citeseeing--cite-commands)))
-      (let* ((modes (car spec))
-             (r-format (cadr spec))
-             (locale (or (and (functionp org-citeseeing-bib-item-locale)
-                              (funcall org-citeseeing-bib-item-locale citekey))
-                         org-citeseeing-bib-item-locale))
-             (proc (org-citeseeing--citeproc-proc command locale))
-             (citations
-              (mapcar (lambda (mode)
-                        (org-citeseeing--citeproc-citation-create
-                         (list citekey) mode))
-                      modes))
-             (mode-to-str
-              (cl-pairlis modes
-                          (org-citeseeing--citeproc-citation-render
-                           proc citations))))
-        (org-citeseeing--format r-format mode-to-str))
-    (error "Unknown renderer spec for cite command (%s)" command)))
+  (catch 'error-intercepted
+    (handler-bind
+        ((error
+          (lambda (err)
+            (let* ((em (error-message-string err))
+                   (str (format "%s:%s (ERR:%s)"
+                                command citekey em)))
+              (org-citeseeing--message "Backtrace:\n%s" (backtrace-to-string))
+              (throw 'error-intercepted
+                     (org-citeseeing--propertize str
+                                                 'org-citeseeing-cite-error-face))))))
+      (if-let* ((cc (gethash command org-citeseeing--cite-commands))
+                (modes (car cc))
+                (fmt-spec (cadr cc))
+                (prefix (nth 0 fmt-spec))
+                (r-format (nth 1 fmt-spec))
+                (suffix (nth 2 fmt-spec)))
+          (let* ((locale (or (and (functionp org-citeseeing-bib-item-locale)
+                                  (funcall org-citeseeing-bib-item-locale citekey))
+                             org-citeseeing-bib-item-locale))
+                 (proc (org-citeseeing--citeproc-proc command locale))
+                 (citations
+                  (mapcar (lambda (mode)
+                            (org-citeseeing--citeproc-citation-create
+                             (list citekey) mode))
+                          modes))
+                 (mode-to-str
+                  (cl-pairlis modes
+                              (org-citeseeing--citeproc-citation-render
+                               proc citations))))
+            (org-citeseeing--propertize (org-citeseeing--format r-format mode-to-str)
+                                        'org-citeseeing-cite-face))
+        (let* ((v (gethash command org-citeseeing--cite-commands))
+               (x (cdr v)))
+          (pp x))
+        (error "Unknown format spec for cite command (%s)" command)))))
 
 (defun org-citeseeing-render-isolated (citekey command)
   "Render CITEKEY according to COMMAND as isolated reference.
@@ -388,55 +450,35 @@ This version might be faster for a few isolated citations, but only 'bib or
         (org-citeseeing--format r-format mode-to-str))
     (error "Unknown renderer spec for cite command (%s)" command)))
 
-(defun org-citeseeing--propertize (str &optional face)
-  "Convert plain Org text tokens in STR into proper face properties.
-When given, FACE is applied additionally."
-  (let* (;; BUG(2026-06-05): Somehow, `citeproc-render-item' can produce
-         ;; Org-rendered string including these HTML tags. Strip them here.
-         (case-fold-search t)
-         (str (replace-regexp-in-string
-               "<Span Class=\"Nocase\">\\|</Span>" "" str))
-
-         (str (with-temp-buffer
-                (insert str)
-                (org-mode)
-                (font-lock-ensure)
-                (buffer-string))))
-    (when face
-      (add-face-text-property 0 (length str) face t str))
-    str))
-
-(defun org-citeseeing-links-generator (type path)
-  "A default fallback generator for link (LNK).
-LNK is the content of an Org link, meaning [[LNK][...]]."
-  ;; (if (string-match "^\\([^:]+\\):\\(.*\\)$" lnk)
-  ;;     )
-  (when-let*
-      ((citekey (and (gethash type org-citeseeing--cite-commands)
-                     (when (string-match "\\`&\\(.*\\)" path)
-                       (substring-no-properties (match-string 1 path)))))
-       (str
-        (catch 'error-intercepted
-          (handler-bind
-              ((error
-                (lambda (err)
-                  (let ((em (error-message-string err)))
-                    (message "Error: %s" em)
-                    (when org-citeseeing-debug
-                      (message "Backtrace:\n%s" (backtrace-to-string)))
-                    (throw 'error-intercepted
-                           (list (format "%s:%s (err: %s)"
-                                         type citekey em)
-                                 'org-citeseeing-cite-error-face))))))
-            (list (org-citeseeing-render-isolated citekey type)
-                  'org-citeseeing-cite-face)))))
-    (apply #'org-citeseeing--propertize str)))
+(defun org-citeseeing--render-citation-link (command path)
+  "Render citation for COMMAND and PATH."
+  (if-let* ((spec (cadr (gethash command org-citeseeing--cite-commands)))
+            (outer-prefix (nth 0 spec))
+            (outer-suffix (nth 2 spec)))
+      (let* ((tokens (org-ref-parse-cite-path path))
+             (inner-prefix (or (plist-get tokens :prefix) ""))
+             (inner-suffix (or (plist-get tokens :suffix) ""))
+             (refs (mapconcat
+                    (lambda (it)
+                      (let* ((prefix (or (plist-get it :prefix) ""))
+                             (suffix (or (plist-get it :suffix) ""))
+                             (citekey (plist-get it :key)))
+                        (concat prefix
+                                (org-citeseeing-render citekey command)
+                                suffix)))
+                    (plist-get tokens :references))))
+        (concat outer-prefix inner-prefix refs inner-suffix outer-suffix))
+    (org-citeseeing--message "Passed link generation for %s" command)))
 
 ;;; Utility Functions
 
 (defun org-citeseeing-langid-to-locale (langid)
   "Get locale for given LANGID."
   (alist-get langid citeproc-blt--langid-to-lang-alist nil nil #'equal))
+
+(defun org-citeseeing--message (s &rest _rest)
+  (when org-citeseeing-debug
+    (apply #'message `(,(concat "[org-citeseeing] " s) ,@_rest))))
 
 (provide 'org-citeseeing)
 ;;; org-citeseeing.el ends here
