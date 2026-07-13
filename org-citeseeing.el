@@ -219,8 +219,7 @@ bibliography manager you are using (e.g., `bibtex-completion' or `citar'."
     (org-citeseeing--oc-processor-activate))
 
   (dolist (fun org-citeseeing-cache-eviction-registry)
-    (when (and (boundp fun)
-               (functionp fun))
+    (when (functionp fun)
       (advice-add fun :after #'org-citeseeing--cache-clear)))
   (advice-add #'org-activate-links :around #'org-citeseeing--activate-links-ad)
   ;; Ensure font-lock natively tracks and cleans up the 'display property when
@@ -238,7 +237,7 @@ bibliography manager you are using (e.g., `bibtex-completion' or `citar'."
   (when (derived-mode-p 'org-mode)
     (org-restart-font-lock))
   (dolist (fun org-citeseeing-cache-eviction-registry)
-    (when (and (boundp fun) (functionp fun))
+    (when (functionp fun)
       (advice-remove fun #'org-citeseeing--cache-clear))))
 
 (defun org-citeseeing--activate-links-ad (fun _limit)
@@ -291,7 +290,7 @@ Intercepts font-lock execution to inject dynamic display strings."
 
 (defun org-citeseeing--cache-clear (&rest _args)
   "Reset item getter."
-  (interactive)               ; add for debug convenience
+  (org-citeseeing--message "Clearing cache...")
   (setq org-citeseeing--citeproc-itemgetter--cache nil
         org-citeseeing--citeproc-proc--cache nil))
 
@@ -410,45 +409,55 @@ The itemgetter function gets cached for BIB-FILES and will be reused."
           (citeproc-render-citations proc 'org 'no-links)))
 
 (defun org-citeseeing--format (template fallback)
-  "Extended version of `s-format' for `citeproc'."
-  (s-format template
-            (lambda (field)
-              (if (string-prefix-p "cp:" field)
-                  (let ((field (intern (substring field 3))))
-                    (or (alist-get field fallback)
-                        (format "?%s?" field)))
-                (or (and (functionp org-citeseeing-bib-item-value-getter)
-                         (funcall org-citeseeing-bib-item-value-getter
-                                  field (alist-get 'citekey fallback)))
-                    (format "?%s?" field))))))
+  "Format TEMPLATE with the alist FALLBACK.
+This function extends `s-format' such that field names with prefix 'cp:'
+instructs the replacer to pull string from FALLBACK (a symbol-value alist)."
+  (s-format
+   template
+   (lambda (field)
+     (if-let*
+         ((value
+           (or (and (string-prefix-p "cp:" field)
+                    (alist-get (intern (substring field 3)) fallback))
+               (and (functionp org-citeseeing-bib-item-value-getter)
+                    (funcall org-citeseeing-bib-item-value-getter
+                             field (alist-get 'citekey fallback))))))
+         value
+       (error "Field '%s' does not yield value for %s"
+              field (alist-get 'citekey fallback))))))
 
-(defun org-citeseeing--propertize (str props)
-  "Convert plain Org text tokens in STR into proper face properties.
-When given, FACE is applied additionally."
-  (let ((str (with-temp-buffer
-               (insert str)
-               (org-mode)
-               (font-lock-ensure)
-               (buffer-string))))
-    (add-text-properties 0 (length str) props str)
+(defun org-citeseeing--propertize (str props &optional face)
+  "Render STR in Org and apply text PROPS and (optionally) FACE."
+  (let* ((str (with-temp-buffer
+                (insert str)
+                (org-mode)
+                (font-lock-ensure)
+                (buffer-string)))
+         (beg 0)
+         (end (length str)))
+    (when face
+      ;; `add-face-text-property', unlike `add-text-properties', is not
+      ;; destructive and thus preferred.
+      (add-face-text-property beg end face nil str))
+    (when props
+      (add-text-properties beg end props str))
     str))
 
 (defun org-citeseeing--citekey-render (command citekey template modes)
-  "Render CITEKEY according to COMMAND.
-TEMPLATE ."
+  "Render CITEKEY item according to COMMAND.
+The underlying `s-format' uses TEMPLATE. MODES are `citeproc' modes extracted
+from TEMPLATE (by having the 'cp:' prefix) to render the bibliography item."
   (catch 'error-intercepted
     (handler-bind
         ((error
           (lambda (err)
-            (org-citeseeing--warn "Error on rendering '%s' for %s:\n%s"
-                                  template
-                                  citekey
-                                  (error-message-string err))
+            (org-citeseeing--warn "Error on rendering citekey %s using template %s: %s"
+                                  citekey template (error-message-string err))
             (org-citeseeing--backtrace)
             (throw 'error-intercepted
                    (org-citeseeing--propertize
                     (format "%s:%s" command citekey)
-                    '(face org-citeseeing-cite-error-face))))))
+                    nil 'org-citeseeing-cite-error-face)))))
       (let* ((locale (org-citeseeing-bib-item-locale citekey))
              (proc (org-citeseeing--citeproc-proc command locale))
              (citations
@@ -457,16 +466,12 @@ TEMPLATE ."
                          (list citekey) mode))
                       modes))
              (fallback
-              (cl-pairlis modes
-                          (org-citeseeing--citeproc-citation-render
-                           proc citations)))
-             (fallback (append fallback
-                               `((citekey . ,citekey)))))
-        (cl-assert template)
+              (append (list (cons 'citekey citekey))
+                      (cl-pairlis modes
+                                  (org-citeseeing--citeproc-citation-render
+                                   proc citations)))))
         (org-citeseeing--propertize (org-citeseeing--format template fallback)
-                                    nil
-                                    ;; '(face org-citeseeing-cite-face)
-                                    )))))
+                                    nil 'org-citeseeing-cite-face)))))
 
 ;; (defun org-citeseeing-render-isolated (citekey command)
 ;;   "Render CITEKEY according to COMMAND as isolated reference.
@@ -558,7 +563,8 @@ Return nil if LANGID is unrecognized."
           (insert (format "Backtrace:\n%s" bt))
           (special-mode)
           (goto-char (point-min))))
-      (pop-to-buffer buf))))
+      ;; (pop-to-buffer buf)
+      )))
 
 (provide 'org-citeseeing)
 ;;; org-citeseeing.el ends here
