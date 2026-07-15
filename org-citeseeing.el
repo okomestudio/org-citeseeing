@@ -290,6 +290,7 @@ Intercepts font-lock execution to inject dynamic display strings."
 
 (defun org-citeseeing--cache-clear (&rest _args)
   "Reset item getter."
+  (interactive)
   (org-citeseeing--message "Clearing cache...")
   (setq org-citeseeing--citeproc-itemgetter--cache nil
         org-citeseeing--citeproc-proc--cache nil))
