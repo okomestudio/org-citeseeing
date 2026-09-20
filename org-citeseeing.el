@@ -511,8 +511,8 @@ from TEMPLATE (by having the 'cp:' prefix) to render the bibliography item."
              (rendered
               (mapconcat
                (lambda (it)
-                 (let* ((prenote (or (plist-get it :prefix) ""))
-                        (postnote (or (plist-get it :suffix) ""))
+                 (let* ((prenote (plist-get it :prefix))
+                        (postnote (plist-get it :suffix))
                         (citekey (plist-get it :key)))
                    (setq locale (org-citeseeing-bib-item-locale citekey))
                    (let* ((spec (or (alist-get locale locale-specs)
@@ -521,10 +521,12 @@ from TEMPLATE (by having the 'cp:' prefix) to render the bibliography item."
                           (inner-suffix (or (plist-get spec :inner-suffix) ""))
                           (cite-format (plist-get spec :cite-format))
                           (modes (plist-get spec :modes)))
-                     (concat inner-prefix prenote
+                     (concat inner-prefix
+                             (if prenote prenote "")
                              (org-citeseeing--citekey-render
                               command citekey cite-format modes)
-                             postnote inner-suffix))))
+                             (if postnote (format ", %s" postnote) "")
+                             inner-suffix))))
                references))
              (spec (or (alist-get locale locale-specs)
                        (alist-get t locale-specs)))
